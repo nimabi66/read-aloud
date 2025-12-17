@@ -1,5 +1,12 @@
+import {
+  WS_READY_STATE,
+  getIsomorphicWebSocket,
+  type IsomorphicMessageEvent,
+  type IsomorphicWebSocket,
+} from "../isomorphic-ws/isomorphic-ws";
 import logger from "../utils/logger";
 import type * as pino from "pino";
+import { randomBytes } from "node:crypto";
 
 export const FORMAT_CONTENT_TYPE = new Map([
   ["raw-16khz-16bit-mono-pcm", "audio/basic"],
@@ -103,48 +110,45 @@ function parseRequestId(data: string) {
 // Path:audio\r\n
 const AUDIO_SEP = [80, 97, 116, 104, 58, 97, 117, 100, 105, 111, 13, 10];
 
-async function handleMessage(message: MessageEvent) {
-  // on Cloudflare, data is ArrayBuffer, on Node, data is Blob
-  const data = message.data as string | ArrayBuffer | Blob;
-  switch (typeof data) {
-    case "string": {
-      const requestId = parseRequestId(data);
-      logger.debug({ requestId, payload: data }, "Received string");
-      return { requestId, data };
-    }
-    case "object": {
-      // type guard helper
-      function isBlob(data: Blob | ArrayBuffer): data is Blob {
-        return data.constructor.name === "Blob";
-      }
-
-      const bufferData = new Uint8Array(
-        // if run in node, data is a Blob, otherwise it's a ArrayBuffer
-        /*
-        Calling arrayBuffer() is not optimal, maybe reading from stream is better,
-        but it actually not a big deal, since we don't have a strict performance requirement
-        when running on Node
-
-        On Cloudflare, data comes as ArrayBuffer, so even we want to read from stream,
-        we cannot. So the 10ms CPU limit is a problem.
-        */
-        isBlob(data) ? await data.arrayBuffer() : data,
-      );
-      const contentIndex =
-        indexOfUint8Array(bufferData, AUDIO_SEP) + AUDIO_SEP.length;
-      const headers = new TextDecoder("utf-8").decode(
-        bufferData.subarray(2, contentIndex),
-      );
-      const payload = bufferData.subarray(contentIndex);
-      const requestId = parseRequestId(headers);
-      logger.debug(
-        { requestId },
-        `Received binary data: ${formatSize(payload)}`,
-      );
-
-      return { requestId, data: bufferData.subarray(contentIndex) };
-    }
+async function handleMessage(message: IsomorphicMessageEvent) {
+  const data = message.data;
+  if (typeof data === "string") {
+    const requestId = parseRequestId(data);
+    logger.debug({ requestId, payload: data }, "Received string");
+    return { requestId, data };
   }
+
+  const bufferData = await toUint8Array(data);
+  const contentIndex =
+    indexOfUint8Array(bufferData, AUDIO_SEP) + AUDIO_SEP.length;
+  const headers = new TextDecoder("utf-8").decode(
+    bufferData.subarray(2, contentIndex),
+  );
+  const payload = bufferData.subarray(contentIndex);
+  const requestId = parseRequestId(headers);
+  logger.debug({ requestId }, `Received binary data: ${formatSize(payload)}`);
+
+  return { requestId, data: bufferData.subarray(contentIndex) };
+}
+
+async function toUint8Array(data: IsomorphicMessageEvent["data"]) {
+  if (data instanceof Uint8Array) {
+    return data;
+  }
+  if (data instanceof ArrayBuffer) {
+    return new Uint8Array(data);
+  }
+  if (ArrayBuffer.isView(data)) {
+    return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+  }
+  if (isBlob(data)) {
+    return new Uint8Array(await data.arrayBuffer());
+  }
+  throw new Error("Unsupported binary data type");
+}
+
+function isBlob(data: unknown): data is Blob {
+  return typeof Blob !== "undefined" && data instanceof Blob;
 }
 
 function buf2hex(buffer: ArrayBuffer) {
@@ -155,12 +159,14 @@ function buf2hex(buffer: ArrayBuffer) {
 
 // provided by and modified from @rexshao
 // https://github.com/yy4382/read-aloud/issues/4#issue-3048109976
-async function getURL() {
+async function getURLAndHeaders() {
   const connectionId = randomUUID().toLowerCase();
   const TRUSTED_CLIENT_TOKEN = "6A5AA1D4EAFF4E9FB37E23D68491D6F4";
   const WIN_EPOCH = 11644473600; // 秒，从Windows纪元到Unix纪元的偏移量
   const S_TO_NS = BigInt(1e9);
-  const SEC_MS_GEC_VERSION = "1-131.0.2903.99";
+  const CHROMIUM_FULL_VERSION = "143.0.3650.75";
+  const CHROMIUM_MAJOR_VERSION = CHROMIUM_FULL_VERSION.split(".")[0];
+  const SEC_MS_GEC_VERSION = `1-${CHROMIUM_FULL_VERSION}`;
   async function generateSecMSGEC() {
     const currentTimestampSeconds = Math.floor(Date.now() / 1000);
 
@@ -184,12 +190,22 @@ async function getURL() {
     return sha256Hash.toUpperCase();
   }
 
+  const muid = randomBytes(16).toString("hex").toUpperCase();
+
   const url = `wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1?TrustedClientToken=${TRUSTED_CLIENT_TOKEN}&Sec-MS-GEC=${await generateSecMSGEC()}&Sec-MS-GEC-Version=${SEC_MS_GEC_VERSION}&ConnectionId=${connectionId}`;
-  return url;
+  const headers = {
+    "User-Agent": `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${CHROMIUM_MAJOR_VERSION}.0.0.0 Safari/537.36 Edg/${CHROMIUM_MAJOR_VERSION}.0.0.0`,
+    "Accept-Encoding": "gzip, deflate, br, zstd", // not required by microsoft for now
+    "Accept-Language": "en-US,en;q=0.9", // not required by microsoft for now
+    Pragma: "no-cache", // not required by microsoft for now,
+    "Cache-Control": "no-cache", // not required by microsoft for now,
+    Cookie: `muid=${muid};`,
+  };
+  return [url, headers] as const;
 }
 
 export class Service {
-  private ws: WebSocket | null = null;
+  private ws: IsomorphicWebSocket | null = null;
 
   /**
    * The timer id to close the connection to microsoft server
@@ -214,8 +230,8 @@ export class Service {
   }
 
   private async connect(): Promise<void> {
-    const url = await getURL();
-    const ws = new WebSocket(url);
+    const [url, headers] = await getURLAndHeaders();
+    const ws = await getIsomorphicWebSocket(url, { headers });
     logger.info("Starting websocket connection to Microsoft server...");
 
     ws.addEventListener("close", (closeEvent) => {
@@ -248,22 +264,34 @@ export class Service {
     });
 
     return new Promise((resolve, reject) => {
-      ws.addEventListener("open", () => {
+      let resolved = false;
+      const handleOpen = () => {
+        if (resolved) {
+          return;
+        }
+        resolved = true;
         logger.info("Connected to Microsoft server");
         this.ws = ws;
         resolve();
-      });
+      };
+
+      ws.addEventListener("open", handleOpen);
+      if (ws.readyState === WS_READY_STATE.OPEN) {
+        handleOpen();
+      }
       ws.addEventListener("error", (error) => {
-        logger.error(`Connection failed: ${error}`);
+        const errorMessage =
+          error instanceof Error ? error.message : String(error);
+        logger.error({ error }, "Connection failed");
         if (this.ws) {
           this.ws.close();
           for (const [id, request] of this.requestMap) {
             request.errorCallback(
-              new Error(`Connection failed：${id} ${error}`),
+              new Error(`Connection failed：${id} ${errorMessage}`),
             );
           }
         } else {
-          reject(`Connection failed： ${error}`);
+          reject(`Connection failed： ${errorMessage}`);
         }
       });
     });
@@ -271,7 +299,7 @@ export class Service {
 
   public async convert(ssml: string, format: string) {
     let perfConnect: number | undefined = undefined;
-    if (this.ws == null || this.ws.readyState !== WebSocket.OPEN) {
+    if (this.ws == null || this.ws.readyState !== WS_READY_STATE.OPEN) {
       const perfConnStart = performance.now();
       await this.connect();
       perfConnect = performance.now() - perfConnStart;
@@ -304,7 +332,7 @@ export class Service {
     // 设置定时器，超过10秒没有收到请求，主动断开连接
     logger.debug("Creating timeout timer for closing connection");
     this.timerId = setTimeout(() => {
-      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      if (this.ws && this.ws.readyState === WS_READY_STATE.OPEN) {
         this.ws.close(1000);
         logger.debug("Connection Closed by client due to inactivity");
         this.timerId = undefined;
